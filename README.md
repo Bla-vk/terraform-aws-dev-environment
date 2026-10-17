@@ -1,10 +1,10 @@
 # AWS Dev Environment with Terraform
 
-Infrastructure as Code project that provisions a complete development environment on AWS using Terraform: a custom VPC, a public subnet with internet access, a security group, an SSH key pair, and an Ubuntu 24.04 EC2 instance that installs Docker on first boot, runs an nginx container, and adds itself to my local SSH config for one-command access.
+Infrastructure as Code project that provisions a complete development environment on AWS using Terraform: a custom VPC, a public subnet with internet access, a private subnet that reaches the internet through a NAT gateway, a security group, an SSH key pair, and an Ubuntu 24.04 EC2 instance that installs Docker on first boot, runs an nginx container, and adds itself to my local SSH config for one-command access.
 
 I built this to rebuild, as code, the VPC and EC2 patterns I first created by hand in the AWS console and CLI (see my [AWS Beginner Roadmap](https://github.com/Bla-vk/AWS-Beginner-Roadmap)). One `terraform apply` now creates in about a minute what took many manual steps before.
 
-**Result:** 9 resources created, server reachable over SSH, Docker running, then everything removed cleanly with `terraform destroy`.
+**Result:** the whole environment builds with one `terraform apply`. The public server is reachable over SSH, runs Docker and serves an nginx page, and a test server in the private subnet reaches the internet only through the NAT gateway (its outbound IP matches the NAT's Elastic IP). Everything is then removed cleanly with `terraform destroy`.
 
 ---
 
@@ -32,7 +32,21 @@ I built this to rebuild, as code, the VPC and EC2 patterns I first created by ha
                        |
               [ Internet Gateway ]  dev-igw
                        |
-        +------ VPC dev (10.100.0.0/16) ------+
+   +------------ VPC dev (10.100.0.0/16) -------------+
+   |                                                  |
+   |  Public route table: 0.0.0.0/0 -> IGW            |
+   |   [ Public subnet 10.100.1.0/24 ]  eu-west-2a    |
+   |     [ EC2 dev-node ]  <- dev-sg                  |
+   |     Ubuntu 24.04, t3.micro, Docker, nginx        |
+   |     [ NAT gateway dev-nat + Elastic IP ]         |
+   |                    ^                             |
+   |  Private route table: 0.0.0.0/0 -> NAT           |
+   |   [ Private subnet 10.100.2.0/24 ]               |
+   |     no public IPs, outbound through the NAT      |
+   +--------------------------------------------------+
+```
+
+------ VPC dev (10.100.0.0/16) ------+
         |                                     |
         |   Public route table                |
         |   0.0.0.0/0 -> IGW                  |
@@ -58,6 +72,10 @@ I built this to rebuild, as code, the VPC and EC2 patterns I first created by ha
 | Route | `0.0.0.0/0` | Sends internet-bound traffic to the Internet Gateway |
 | Route table association | n/a | Attaches the route table to the public subnet |
 | Security group | `dev-sg` | Allows SSH (port 22) and HTTP (port 80) only from my current public IP, looked up automatically on each run (see [Security Notes](#security-notes)) |
+| Private subnet | `dev-private-subnet` | `10.100.2.0/24`, no public IPs, outbound access only through the NAT gateway |
+| Elastic IP | n/a | Fixed public address used by the NAT gateway |
+| NAT gateway | `dev-nat` | Lets private resources reach the internet without being reachable from it. Billed hourly, so it is applied for testing and destroyed the same day |
+| Private route table and association | `dev-private-route-table` | Sends `0.0.0.0/0` from the private subnet to the NAT gateway |
 | Key pair | `main-key` | Registers my local public SSH key with AWS |
 | EC2 instance | `dev-node` | `t3.micro`, Ubuntu 24.04 LTS, 10 GB gp3 root volume, Docker installed at boot, nginx container running on port 80 |
 
@@ -195,6 +213,18 @@ terraform destroy
 
 After `terraform destroy`, delete the old `Host` block for that IP from `~/.ssh/config`.
 
+### Testing the NAT gateway
+
+To prove the private subnet reaches the internet through the NAT, I add a temporary test server (a `private-test.tf` file with one instance in the private subnet and a security group that allows SSH only from `dev-sg`), then use the public server as a jump host:
+
+```bash
+terraform output nat_public_ip
+ssh -i ~/.ssh/mainkey -J ubuntu@$(terraform output -raw dev_ip) ubuntu@$(terraform output -raw private_test_ip)
+curl https://checkip.amazonaws.com    # run on the private server
+```
+
+The address `curl` prints must equal `nat_public_ip`. I remove the test file and run `terraform destroy` afterwards, because the NAT gateway bills by the hour.
+
 ---
 
 ## Results
@@ -249,6 +279,37 @@ All 9 resources are removed cleanly, leaving nothing running or billing in the a
 
 ![terraform destroy](screenshots/08-terraform-destroy.png)
 
+*Screenshots 1 to 10 were taken on the earlier version of the project, before the NAT gateway was added.*
+
+### 11. Private test server with no public IP
+A test server in the private subnet (`10.100.2.81`) has no public IPv4 address, so it cannot be reached from the internet. The apply output also shows the NAT gateway's public IP (`nat_public_ip`).
+
+![private test instance](screenshots/15-private-test-instance.png)
+
+![terraform apply for the test server](screenshots/16-nat-apply.png)
+
+### 12. NAT gateway
+`dev-nat` is **Available**, sits in `dev-public-subnet`, and has an Elastic IP as its public address.
+
+![nat gateway](screenshots/12-nat-gateway.png)
+
+### 13. Private route table
+The private route table sends `0.0.0.0/0` to the NAT gateway, and it is associated with `dev-private-subnet`.
+
+![private route table routes](screenshots/13-private-route-table-routes.png)
+
+![private route table association](screenshots/14-private-route-table-association.png)
+
+### 14. Outbound internet through the NAT
+After SSHing to the private server through the public server (jump host), `curl https://checkip.amazonaws.com` prints `13.134.159.226`, the same address as the `nat_public_ip` output. This shows the private server's outbound traffic leaves through the NAT gateway.
+
+![nat curl test](screenshots/11-nat-curl-test.png)
+
+### 15. Cleanup
+`terraform destroy` removes everything, including the NAT gateway and Elastic IP, so nothing keeps billing.
+
+![nat destroy](screenshots/17-nat-destroy.png)
+
 ---
 
 ## Troubleshooting
@@ -271,6 +332,7 @@ Problems I hit while building this, and what fixed them:
 This is a learning environment, and a few choices are intentionally simple. Before using this pattern for anything real, I would change the following:
 
 - **SSH and the web server are restricted to my current IP.** `dev-sg` allows port 22 and port 80 only from my own public IP (`/32`), and no other ports are open. Terraform looks the IP up on every run, so the rule follows me when it changes, but only when I run `terraform apply`. Running plans from a different network (a VPN, or a CI runner) would use that network's IP instead, so I run `plan` and `apply` locally. Port 22 is still reachable by anyone who shares my IP, for example on a shared ISP address, and key-based login is the second layer of protection.
+- **The private subnet is not reachable from the internet.** Servers there have no public IP, and the test server's security group allows SSH only from `dev-sg`, so I reach it through the public server as a jump host. NAT gateways cost money by the hour, so I only keep it running while testing.
 - **Credentials stay out of the code.** Authentication uses a local named profile, and the private key never leaves my machine.
 - **State and secrets stay out of Git.** `terraform.tfstate` can contain sensitive values, so the `.gitignore` excludes state files, `.terraform/`, `*.tfvars`, keys and `.env` files. `.terraform.lock.hcl` is committed so provider versions stay consistent. For team use, state would move to a remote backend such as S3 with locking.
 - **Screenshots are redacted.** My home IP and AWS account ID are covered.
@@ -279,7 +341,7 @@ This is a learning environment, and a few choices are intentionally simple. Befo
 
 ## Skills Demonstrated
 
-Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet Gateways, Security Groups, EC2, SSH key management, data sources, input variables and outputs, `user_data` bootstrapping, Docker Engine installation on Ubuntu, running a container from `user_data`, least-privilege security group rules, Linux package management, `local-exec` provisioners, `templatefile` rendering, SSH config automation, troubleshooting with cloud-init logs, secrets hygiene with `.gitignore`
+Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet Gateways, Security Groups, EC2, SSH key management, data sources, input variables and outputs, `user_data` bootstrapping, Docker Engine installation on Ubuntu, running a container from `user_data`, least-privilege security group rules, private subnets, NAT gateways and Elastic IPs, SSH jump hosts, Linux package management, `local-exec` provisioners, `templatefile` rendering, SSH config automation, troubleshooting with cloud-init logs, secrets hygiene with `.gitignore`
 
 ---
 
@@ -292,6 +354,7 @@ Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet G
 - Variables let one codebase work across operating systems.
 - State tracks real infrastructure, so it must be protected and kept out of version control.
 - Modules let one piece of infrastructure feed another through input variables and outputs, and `${path.module}` keeps file paths working from inside a module.
+- A private subnet needs a NAT gateway in a public subnet and a route to it before its servers can reach the internet. Comparing the server's outbound IP with the NAT's Elastic IP proves the route works.
 - Opening only the port an app needs, and only to my own IP, keeps a public web server from being exposed to the whole internet.
 - Public IPs change when instances are replaced, so stale SSH config entries are a common cause of connection timeouts.
 
@@ -304,9 +367,9 @@ Done:
 - SSH restricted to my current IP, updated automatically by Terraform
 - Containerised app (nginx in Docker) started from `user_data`, with only port 80 open and only to my IP
 - Refactored into reusable `network` and `compute` modules
+- Added a private subnet and NAT gateway, tested outbound access from a private server through a jump host
 
 Still to do:
 
-- Add a private subnet and NAT gateway, and test outbound access from a private instance through a jump host
 - Move state to a remote S3 backend with versioning and locking, then migrate the local state with `terraform init -migrate-state`
 - Add a GitHub Actions workflow to run `terraform fmt -check` and `terraform validate` on every push
