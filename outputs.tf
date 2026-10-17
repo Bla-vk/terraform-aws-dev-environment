@@ -3,5 +3,5 @@ output "dev_ip" {
 }
 
 output "nat_public_ip" {
-  value = module.network.nat_public_ip
+  value =    module.network.nat_public_ip
 }
