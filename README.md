@@ -1,5 +1,7 @@
 # AWS Dev Environment with Terraform
 
+![Terraform checks](https://github.com/Bla-vk/terraform-aws-dev-environment/actions/workflows/terraform.yml/badge.svg)
+
 Infrastructure as Code project that provisions a complete development environment on AWS using Terraform: a custom VPC, a public subnet with internet access, a private subnet that reaches the internet through a NAT gateway, a security group, an SSH key pair, and an Ubuntu 24.04 EC2 instance that installs Docker on first boot, runs an nginx container, and adds itself to my local SSH config for one-command access.
 
 I built this to rebuild, as code, the VPC and EC2 patterns I first created by hand in the AWS console and CLI (see my [AWS Beginner Roadmap](https://github.com/Bla-vk/AWS-Beginner-Roadmap)). One `terraform apply` now creates in about a minute what took many manual steps before.
