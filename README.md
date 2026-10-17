@@ -46,38 +46,25 @@ I built this to rebuild, as code, the VPC and EC2 patterns I first created by ha
    +--------------------------------------------------+
 ```
 
------- VPC dev (10.100.0.0/16) ------+
-        |                                     |
-        |   Public route table                |
-        |   0.0.0.0/0 -> IGW                  |
-        |        |                            |
-        |   [ Public subnet 10.100.1.0/24 ]   |
-        |   eu-west-2a                        |
-        |        |                            |
-        |   [ EC2 dev-node ]  <- dev-sg       |
-        |   Ubuntu 24.04, t3.micro, Docker    |
-        +-------------------------------------+
-```
-
 ---
 
 ## What It Builds
 
-| Resource | Name | Purpose |
-|---|---|---|
-| VPC | `dev` | Isolated network, CIDR `10.100.0.0/16`, DNS support and hostnames enabled |
-| Public subnet | `dev-public-subnet` | `10.100.1.0/24` in `eu-west-2a`, auto-assigns public IPs |
-| Internet Gateway | `dev-igw` | Gives the VPC a path to the internet |
-| Route table | `dev-public-route-table` | Holds the public routing rules |
-| Route | `0.0.0.0/0` | Sends internet-bound traffic to the Internet Gateway |
-| Route table association | n/a | Attaches the route table to the public subnet |
-| Security group | `dev-sg` | Allows SSH (port 22) and HTTP (port 80) only from my current public IP, looked up automatically on each run (see [Security Notes](#security-notes)) |
-| Private subnet | `dev-private-subnet` | `10.100.2.0/24`, no public IPs, outbound access only through the NAT gateway |
-| Elastic IP | n/a | Fixed public address used by the NAT gateway |
-| NAT gateway | `dev-nat` | Lets private resources reach the internet without being reachable from it. Billed hourly, so it is applied for testing and destroyed the same day |
-| Private route table and association | `dev-private-route-table` | Sends `0.0.0.0/0` from the private subnet to the NAT gateway |
-| Key pair | `main-key` | Registers my local public SSH key with AWS |
-| EC2 instance | `dev-node` | `t3.micro`, Ubuntu 24.04 LTS, 10 GB gp3 root volume, Docker installed at boot, nginx container running on port 80 |
+| Resource                            | Name                      | Purpose                                                                                                                                             |
+| ----------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| VPC                                 | `dev`                     | Isolated network, CIDR `10.100.0.0/16`, DNS support and hostnames enabled                                                                           |
+| Public subnet                       | `dev-public-subnet`       | `10.100.1.0/24` in `eu-west-2a`, auto-assigns public IPs                                                                                            |
+| Internet Gateway                    | `dev-igw`                 | Gives the VPC a path to the internet                                                                                                                |
+| Route table                         | `dev-public-route-table`  | Holds the public routing rules                                                                                                                      |
+| Route                               | `0.0.0.0/0`               | Sends internet-bound traffic to the Internet Gateway                                                                                                |
+| Route table association             | n/a                       | Attaches the route table to the public subnet                                                                                                       |
+| Security group                      | `dev-sg`                  | Allows SSH (port 22) and HTTP (port 80) only from my current public IP, looked up automatically on each run (see [Security Notes](#security-notes)) |
+| Private subnet                      | `dev-private-subnet`      | `10.100.2.0/24`, no public IPs, outbound access only through the NAT gateway                                                                        |
+| Elastic IP                          | n/a                       | Fixed public address used by the NAT gateway                                                                                                        |
+| NAT gateway                         | `dev-nat`                 | Lets private resources reach the internet without being reachable from it. Billed hourly, so it is applied for testing and destroyed the same day   |
+| Private route table and association | `dev-private-route-table` | Sends `0.0.0.0/0` from the private subnet to the NAT gateway                                                                                        |
+| Key pair                            | `main-key`                | Registers my local public SSH key with AWS                                                                                                          |
+| EC2 instance                        | `dev-node`                | `t3.micro`, Ubuntu 24.04 LTS, 10 GB gp3 root volume, Docker installed at boot, nginx container running on port 80                                   |
 
 ---
 
@@ -230,58 +217,69 @@ The address `curl` prints must equal `nat_public_ip`. I remove the test file and
 ## Results
 
 ### 1. `terraform plan`
+
 Terraform previews the resources it will create before changing anything: **9 to add, 0 to change, 0 to destroy**.
 
 ![terraform plan](screenshots/01-terraform-plan.png)
 
 ### 2. `terraform apply`
+
 All 9 resources are created, and the instance's public IP is returned as an output.
 
 ![terraform apply](screenshots/02-terraform-apply.png)
 
 ### 3. SSH into the instance
+
 Connecting to the new Ubuntu 24.04 server with the key pair Terraform registered.
 
 ![ssh session](screenshots/03-ssh-session.png)
 
 ### 4. Docker installed by `user_data`
+
 `cloud-init status` reports `done`, and Docker 29.9.0 runs the `hello-world` container, confirming the bootstrap script worked with no manual setup.
 
 ![docker hello-world](screenshots/04-docker-hello-world.png)
 
 ### 5. nginx container serving a web page
+
 A container started by `user_data` serves the nginx welcome page on port 80. `curl` and the browser both reach it from my machine, because the security group opens port 80 to my IP only.
 
 ![nginx welcome page](screenshots/09-nginx-container.png)
 
 ### 6. Resources organised into modules
+
 `terraform state list` shows every resource under `module.network` or `module.compute`, confirming the refactor into two modules applied cleanly.
 
 ![terraform state list](screenshots/10-module-state-list.png)
 
 ### 7. EC2 instance in the AWS console
+
 `dev-node` is running with 3/3 status checks passed.
 
 ![ec2 instance](screenshots/05-ec2-instance.png)
 
 ### 8. VPC in the AWS console
+
 The `dev` VPC with DNS resolution and DNS hostnames enabled.
 
 ![vpc](screenshots/06-vpc.png)
 
 ### 9. Public subnet in the AWS console
+
 `dev-public-subnet` (`10.100.1.0/24`) in `eu-west-2a`.
 
 ![public subnet](screenshots/07-public-subnet.png)
 
 ### 10. `terraform destroy`
+
 All 9 resources are removed cleanly, leaving nothing running or billing in the account.
 
 ![terraform destroy](screenshots/08-terraform-destroy.png)
 
-*Screenshots 1 to 10 were taken on the earlier version of the project, before the NAT gateway was added.*
+_Screenshots 1 to 10 were taken on the earlier version of the project, before the NAT gateway was added._
 
 ### 11. Private test server with no public IP
+
 A test server in the private subnet (`10.100.2.81`) has no public IPv4 address, so it cannot be reached from the internet. The apply output also shows the NAT gateway's public IP (`nat_public_ip`).
 
 ![private test instance](screenshots/15-private-test-instance.png)
@@ -289,11 +287,13 @@ A test server in the private subnet (`10.100.2.81`) has no public IPv4 address, 
 ![terraform apply for the test server](screenshots/16-nat-apply.png)
 
 ### 12. NAT gateway
+
 `dev-nat` is **Available**, sits in `dev-public-subnet`, and has an Elastic IP as its public address.
 
 ![nat gateway](screenshots/12-nat-gateway.png)
 
 ### 13. Private route table
+
 The private route table sends `0.0.0.0/0` to the NAT gateway, and it is associated with `dev-private-subnet`.
 
 ![private route table routes](screenshots/13-private-route-table-routes.png)
@@ -301,11 +301,13 @@ The private route table sends `0.0.0.0/0` to the NAT gateway, and it is associat
 ![private route table association](screenshots/14-private-route-table-association.png)
 
 ### 14. Outbound internet through the NAT
+
 After SSHing to the private server through the public server (jump host), `curl https://checkip.amazonaws.com` prints `13.134.159.226`, the same address as the `nat_public_ip` output. This shows the private server's outbound traffic leaves through the NAT gateway.
 
 ![nat curl test](screenshots/11-nat-curl-test.png)
 
 ### 15. Cleanup
+
 `terraform destroy` removes everything, including the NAT gateway and Elastic IP, so nothing keeps billing.
 
 ![nat destroy](screenshots/17-nat-destroy.png)
@@ -316,14 +318,14 @@ After SSHing to the private server through the public server (jump host), `curl 
 
 Problems I hit while building this, and what fixed them:
 
-| Problem | Cause | Fix |
-|---|---|---|
-| `docker: command not found` after SSH | `user_data` runs in the background after boot, and can fail or not run at all | Run `cloud-init status` and wait for `done`. Read `/var/log/cloud-init-output.log` for the failing command |
-| `user_data` edits have no effect | `user_data` only runs on first boot, and the instance is not replaced when it changes | Set `user_data_replace_on_change = true`, or run `terraform apply -replace=aws_instance.dev_node` |
-| SSH or VS Code Remote-SSH times out | The saved IP belonged to an instance that no longer existed (after a destroy or stop/start the public IP changes) | Run `terraform output dev_ip`, confirm the instance is running, and remove stale `Host` entries from `~/.ssh/config` |
-| SSH times out even though the instance is running | My public IP changed (new network, VPN or router restart), so the security group no longer matches | Run `terraform apply` from the network I am connecting from. The rule updates in place |
-| `Reference to undeclared resource` during `plan` | Example code used placeholder resource names (`aws_subnet.public`) that did not match the names in my `main.tf` | Run `grep -n '^resource' main.tf` to list the real names and use those. `terraform validate` catches this in seconds |
-| `permission denied` running `docker` | Group membership only applies to new login sessions | Log out and back in |
+| Problem                                           | Cause                                                                                                             | Fix                                                                                                                  |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `docker: command not found` after SSH             | `user_data` runs in the background after boot, and can fail or not run at all                                     | Run `cloud-init status` and wait for `done`. Read `/var/log/cloud-init-output.log` for the failing command           |
+| `user_data` edits have no effect                  | `user_data` only runs on first boot, and the instance is not replaced when it changes                             | Set `user_data_replace_on_change = true`, or run `terraform apply -replace=aws_instance.dev_node`                    |
+| SSH or VS Code Remote-SSH times out               | The saved IP belonged to an instance that no longer existed (after a destroy or stop/start the public IP changes) | Run `terraform output dev_ip`, confirm the instance is running, and remove stale `Host` entries from `~/.ssh/config` |
+| SSH times out even though the instance is running | My public IP changed (new network, VPN or router restart), so the security group no longer matches                | Run `terraform apply` from the network I am connecting from. The rule updates in place                               |
+| `Reference to undeclared resource` during `plan`  | Example code used placeholder resource names (`aws_subnet.public`) that did not match the names in my `main.tf`   | Run `grep -n '^resource' main.tf` to list the real names and use those. `terraform validate` catches this in seconds |
+| `permission denied` running `docker`              | Group membership only applies to new login sessions                                                               | Log out and back in                                                                                                  |
 
 ---
 
