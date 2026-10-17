@@ -16,3 +16,4 @@ sudo apt-get update -y
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io
 
 sudo usermod -aG docker ubuntu
+docker run -d --restart unless-stopped --name web -p 80:80 nginx:stable
