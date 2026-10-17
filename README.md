@@ -1,6 +1,6 @@
 # AWS Dev Environment with Terraform
 
-Infrastructure as Code project that provisions a complete development environment on AWS using Terraform: a custom VPC, a public subnet with internet access, a security group, an SSH key pair, and an Ubuntu 24.04 EC2 instance that installs Docker on first boot and adds itself to my local SSH config for one-command access.
+Infrastructure as Code project that provisions a complete development environment on AWS using Terraform: a custom VPC, a public subnet with internet access, a security group, an SSH key pair, and an Ubuntu 24.04 EC2 instance that installs Docker on first boot, runs an nginx container, and adds itself to my local SSH config for one-command access.
 
 I built this to rebuild, as code, the VPC and EC2 patterns I first created by hand in the AWS console and CLI (see my [AWS Beginner Roadmap](https://github.com/Bla-vk/AWS-Beginner-Roadmap)). One `terraform apply` now creates in about a minute what took many manual steps before.
 
@@ -57,9 +57,9 @@ I built this to rebuild, as code, the VPC and EC2 patterns I first created by ha
 | Route table | `dev-public-route-table` | Holds the public routing rules |
 | Route | `0.0.0.0/0` | Sends internet-bound traffic to the Internet Gateway |
 | Route table association | n/a | Attaches the route table to the public subnet |
-| Security group | `dev-sg` | Controls traffic to the instance (see [Security Notes](#security-notes)) |
+| Security group | `dev-sg` | Allows SSH (port 22) and HTTP (port 80) only from my current public IP, looked up automatically on each run (see [Security Notes](#security-notes)) |
 | Key pair | `main-key` | Registers my local public SSH key with AWS |
-| EC2 instance | `dev-node` | `t3.micro`, Ubuntu 24.04 LTS, 10 GB gp3 root volume, Docker installed at boot |
+| EC2 instance | `dev-node` | `t3.micro`, Ubuntu 24.04 LTS, 10 GB gp3 root volume, Docker installed at boot, nginx container running on port 80 |
 
 ---
 
@@ -67,16 +67,26 @@ I built this to rebuild, as code, the VPC and EC2 patterns I first created by ha
 
 ```
 .
-├── providers.tf           # Terraform and AWS provider configuration
-├── main.tf                # VPC, networking, security group, key pair, EC2 instance
-├── datasources.tf         # Looks up the latest Ubuntu 24.04 AMI
-├── variables.tf           # Input variables (host_os)
-├── outputs.tf             # Exposes the instance public IP
-├── userdata.tpl           # First-boot script that installs Docker Engine
-├── linux-ssh-config.tpl   # SSH config template appended to ~/.ssh/config
-├── .gitignore             # Keeps state, keys and secrets out of Git
-└── screenshots/           # Evidence of each stage of the build
+├── providers.tf               # Terraform and AWS provider configuration
+├── main.tf                    # Calls the network and compute modules
+├── variables.tf               # Input variables (host_os)
+├── outputs.tf                 # Exposes the instance public IP
+├── modules/
+│   ├── network/
+│   │   ├── main.tf            # VPC, subnets, gateway, routes, security group, IP lookup
+│   │   ├── nat.tf             # NAT gateway pieces (added in a later step)
+│   │   └── outputs.tf         # subnet and security group IDs passed to compute
+│   └── compute/
+│       ├── main.tf            # AMI lookup, key pair, EC2 instance, provisioner
+│       ├── variables.tf       # subnet_id, security_group_id, host_os
+│       ├── outputs.tf         # instance public IP
+│       ├── userdata.tpl       # First-boot script: installs Docker, starts nginx
+│       └── linux-ssh-config.tpl   # SSH config template appended to ~/.ssh/config
+├── .gitignore                 # Keeps state, keys and secrets out of Git
+└── screenshots/               # Evidence of each stage of the build
 ```
+
+The code is split into two modules: `network` builds the networking and security group, and `compute` builds the server that runs inside it. The root `main.tf` only wires them together.
 
 Each file has one job, which keeps the project easy to read and extend.
 
@@ -84,28 +94,38 @@ Each file has one job, which keeps the project easy to read and extend.
 
 ## How It Works
 
-**providers.tf** pins the AWS provider to `~> 6.0`, sets the region to `eu-west-2` (London), and authenticates through a named local profile (`vscode`), so no credentials are ever written in code.
+**providers.tf** pins the AWS provider to `~> 6.0` (and the `http` provider to `~> 3.0`), sets the region to `eu-west-2` (London), and authenticates through a named local profile (`vscode`), so no credentials are ever written in code.
 
-**datasources.tf** uses an `aws_ami` data source to find the most recent Ubuntu 24.04 (Noble) image published by Canonical (owner `099720109477`). The AMI ID is never hardcoded, so each run uses a current image.
+**Root `main.tf`** calls two modules. `module "network"` builds the network and returns the public subnet ID and the security group ID. `module "compute"` receives those two values as input variables and launches the server in that subnet with that security group. Terraform works out from these references that the network must exist before the server.
 
-**main.tf** builds the network first, then the compute:
+**Network module (`modules/network`)**:
 
-1. Creates the VPC and a public subnet.
-2. Creates the Internet Gateway, a route table and a default route to the gateway, then associates the route table with the subnet. This is what makes the subnet public.
-3. Creates the security group and the key pair (reading the public key from `~/.ssh/mainkey.pub`).
-4. Launches the EC2 instance using the AMI from the data source, the key pair, the security group and a `user_data` script.
-5. Runs a `local-exec` provisioner once the instance exists. It renders an SSH config template with the instance's public IP and appends it to my local `~/.ssh/config`, so I can connect without looking up the IP.
+1. Creates the VPC, a public subnet and a private subnet.
+2. Creates the Internet Gateway, a route table and a default route to the gateway, then associates the route table with the public subnet. This is what makes the subnet public.
+3. Creates the security group. A data source (`http`) asks `checkip.amazonaws.com` for my current public IP on every `plan` and `apply`, and a local value turns it into a `/32` CIDR for the SSH and HTTP rules. If my IP changes, the next `terraform apply` updates the rules in place and the instance is not replaced.
+4. Outputs the public subnet ID, private subnet ID and security group ID.
 
-**userdata.tpl** is a bash script EC2 runs once on first boot. It installs Docker Engine from Docker's official apt repository:
+**Compute module (`modules/compute`)**:
+
+1. Looks up the most recent Ubuntu 24.04 (Noble) image published by Canonical (owner `099720109477`) with an `aws_ami` data source, so the AMI ID is never hardcoded.
+2. Creates the key pair, reading the public key from `~/.ssh/mainkey.pub`.
+3. Launches the EC2 instance using the AMI, the key pair, the `subnet_id` and `security_group_id` it was given, and a `user_data` script.
+4. Runs a `local-exec` provisioner once the instance exists. It renders an SSH config template with the instance's public IP and appends it to my local `~/.ssh/config`, so I can connect without looking up the IP.
+5. Outputs the instance's public IP.
+
+Paths to the two template files use `${path.module}`, so they resolve inside the module folder wherever Terraform is run from.
+
+**modules/compute/userdata.tpl** is a bash script EC2 runs once on first boot. It installs Docker Engine from Docker's official apt repository:
 
 1. Updates packages and installs `ca-certificates`, `curl` and `gnupg`.
 2. Adds Docker's GPG key and apt repository, so signed official packages are used.
 3. Installs `docker-ce`, `docker-ce-cli` and `containerd.io`.
 4. Adds the `ubuntu` user to the `docker` group, so Docker works without `sudo`.
+5. Starts an `nginx` container with `docker run -d --restart unless-stopped -p 80:80`, so a web server is running as soon as the instance finishes booting.
 
 `set -e` makes the script stop at the first failing command instead of continuing half-configured.
 
-**linux-ssh-config.tpl** is the template the provisioner fills in. Terraform supplies the public IP, login user and key path, and appends this block to `~/.ssh/config`:
+**modules/compute/linux-ssh-config.tpl** is the template the provisioner fills in. Terraform supplies the public IP, login user and key path, and appends this block to `~/.ssh/config`:
 
 ```
 Host <public ip>
@@ -118,9 +138,9 @@ Tools such as VS Code Remote-SSH and plain `ssh` can then connect straight away.
 
 **variables.tf** defines `host_os` (default `linux`), which selects the SSH config template and shell interpreter used by the provisioner. Only the Linux template (`linux-ssh-config.tpl`) is included, so a `windows-ssh-config.tpl` would be needed to run this on Windows.
 
-**outputs.tf** prints the instance's public IP after `apply`.
+**outputs.tf** (root) prints the instance's public IP after `apply`, reading it from the compute module's output.
 
-Terraform resolves references such as `aws_vpc.main_vpc.id` into a dependency graph, so it creates everything in the correct order automatically.
+Terraform resolves references such as `module.network.public_subnet_id` into a dependency graph, so it creates everything in the correct order automatically.
 
 ---
 
@@ -164,6 +184,10 @@ ssh -i ~/.ssh/mainkey ubuntu@<dev_ip>
 cloud-init status
 docker --version
 docker run hello-world
+docker ps            # the nginx container should be listed
+
+# 7b. From my own machine, check the web server
+curl http://<dev_ip>
 
 # 8. Destroy everything when finished to avoid charges
 terraform destroy
@@ -195,22 +219,32 @@ Connecting to the new Ubuntu 24.04 server with the key pair Terraform registered
 
 ![docker hello-world](screenshots/04-docker-hello-world.png)
 
-### 5. EC2 instance in the AWS console
+### 5. nginx container serving a web page
+A container started by `user_data` serves the nginx welcome page on port 80. `curl` and the browser both reach it from my machine, because the security group opens port 80 to my IP only.
+
+![nginx welcome page](screenshots/09-nginx-container.png)
+
+### 6. Resources organised into modules
+`terraform state list` shows every resource under `module.network` or `module.compute`, confirming the refactor into two modules applied cleanly.
+
+![terraform state list](screenshots/10-module-state-list.png)
+
+### 7. EC2 instance in the AWS console
 `dev-node` is running with 3/3 status checks passed.
 
 ![ec2 instance](screenshots/05-ec2-instance.png)
 
-### 6. VPC in the AWS console
+### 8. VPC in the AWS console
 The `dev` VPC with DNS resolution and DNS hostnames enabled.
 
 ![vpc](screenshots/06-vpc.png)
 
-### 7. Public subnet in the AWS console
+### 9. Public subnet in the AWS console
 `dev-public-subnet` (`10.100.1.0/24`) in `eu-west-2a`.
 
 ![public subnet](screenshots/07-public-subnet.png)
 
-### 8. `terraform destroy`
+### 10. `terraform destroy`
 All 9 resources are removed cleanly, leaving nothing running or billing in the account.
 
 ![terraform destroy](screenshots/08-terraform-destroy.png)
@@ -226,6 +260,8 @@ Problems I hit while building this, and what fixed them:
 | `docker: command not found` after SSH | `user_data` runs in the background after boot, and can fail or not run at all | Run `cloud-init status` and wait for `done`. Read `/var/log/cloud-init-output.log` for the failing command |
 | `user_data` edits have no effect | `user_data` only runs on first boot, and the instance is not replaced when it changes | Set `user_data_replace_on_change = true`, or run `terraform apply -replace=aws_instance.dev_node` |
 | SSH or VS Code Remote-SSH times out | The saved IP belonged to an instance that no longer existed (after a destroy or stop/start the public IP changes) | Run `terraform output dev_ip`, confirm the instance is running, and remove stale `Host` entries from `~/.ssh/config` |
+| SSH times out even though the instance is running | My public IP changed (new network, VPN or router restart), so the security group no longer matches | Run `terraform apply` from the network I am connecting from. The rule updates in place |
+| `Reference to undeclared resource` during `plan` | Example code used placeholder resource names (`aws_subnet.public`) that did not match the names in my `main.tf` | Run `grep -n '^resource' main.tf` to list the real names and use those. `terraform validate` catches this in seconds |
 | `permission denied` running `docker` | Group membership only applies to new login sessions | Log out and back in |
 
 ---
@@ -234,7 +270,7 @@ Problems I hit while building this, and what fixed them:
 
 This is a learning environment, and a few choices are intentionally simple. Before using this pattern for anything real, I would change the following:
 
-- **The security group is fully open.** `dev-sg` allows all inbound traffic from `0.0.0.0/0`. In a real environment I would allow only SSH (port 22) from my own IP, plus only the ports the application needs. This is the first thing I would harden.
+- **SSH and the web server are restricted to my current IP.** `dev-sg` allows port 22 and port 80 only from my own public IP (`/32`), and no other ports are open. Terraform looks the IP up on every run, so the rule follows me when it changes, but only when I run `terraform apply`. Running plans from a different network (a VPN, or a CI runner) would use that network's IP instead, so I run `plan` and `apply` locally. Port 22 is still reachable by anyone who shares my IP, for example on a shared ISP address, and key-based login is the second layer of protection.
 - **Credentials stay out of the code.** Authentication uses a local named profile, and the private key never leaves my machine.
 - **State and secrets stay out of Git.** `terraform.tfstate` can contain sensitive values, so the `.gitignore` excludes state files, `.terraform/`, `*.tfvars`, keys and `.env` files. `.terraform.lock.hcl` is committed so provider versions stay consistent. For team use, state would move to a remote backend such as S3 with locking.
 - **Screenshots are redacted.** My home IP and AWS account ID are covered.
@@ -243,7 +279,7 @@ This is a learning environment, and a few choices are intentionally simple. Befo
 
 ## Skills Demonstrated
 
-Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet Gateways, Security Groups, EC2, SSH key management, data sources, input variables and outputs, `user_data` bootstrapping, Docker Engine installation on Ubuntu, Linux package management, `local-exec` provisioners, `templatefile` rendering, SSH config automation, troubleshooting with cloud-init logs, secrets hygiene with `.gitignore`
+Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet Gateways, Security Groups, EC2, SSH key management, data sources, input variables and outputs, `user_data` bootstrapping, Docker Engine installation on Ubuntu, running a container from `user_data`, least-privilege security group rules, Linux package management, `local-exec` provisioners, `templatefile` rendering, SSH config automation, troubleshooting with cloud-init logs, secrets hygiene with `.gitignore`
 
 ---
 
@@ -255,15 +291,22 @@ Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet G
 - Data sources are better than hardcoded values for things like AMI IDs that change over time.
 - Variables let one codebase work across operating systems.
 - State tracks real infrastructure, so it must be protected and kept out of version control.
+- Modules let one piece of infrastructure feed another through input variables and outputs, and `${path.module}` keeps file paths working from inside a module.
+- Opening only the port an app needs, and only to my own IP, keeps a public web server from being exposed to the whole internet.
 - Public IPs change when instances are replaced, so stale SSH config entries are a common cause of connection timeouts.
 
 ---
 
 ## Next Steps
 
-- Restrict the security group to SSH from my IP only
-- Run a containerised app on the instance and expose only its port
-- Add a private subnet and NAT gateway
-- Move state to a remote S3 backend with locking
-- Refactor into reusable modules
-- Add a GitHub Actions workflow to run `terraform fmt` and `terraform validate` on every push
+Done:
+
+- SSH restricted to my current IP, updated automatically by Terraform
+- Containerised app (nginx in Docker) started from `user_data`, with only port 80 open and only to my IP
+- Refactored into reusable `network` and `compute` modules
+
+Still to do:
+
+- Add a private subnet and NAT gateway, and test outbound access from a private instance through a jump host
+- Move state to a remote S3 backend with versioning and locking, then migrate the local state with `terraform init -migrate-state`
+- Add a GitHub Actions workflow to run `terraform fmt -check` and `terraform validate` on every push
