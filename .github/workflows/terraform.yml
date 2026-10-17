@@ -1,0 +1,34 @@
+name: Terraform checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '~> 1.10'
+
+      - name: Create a dummy SSH public key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/mainkey
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialise without the backend
+        run: terraform init -backend=false
+
+      - name: Validate
+        run: terraform validate
