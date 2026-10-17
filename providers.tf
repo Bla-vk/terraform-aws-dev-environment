@@ -10,6 +10,15 @@ terraform {
       version = "~> 3.0"
     }
   }
+
+  backend "s3" {
+    bucket       = "precious-terraformstate-dev-2026" # your bucket name
+    key          = "dev-environment/terraform.tfstate"
+    region       = "eu-west-2"
+    profile      = "vscode"
+    encrypt      = true
+    use_lockfile = true
+  }
 }
 
 provider "aws" {

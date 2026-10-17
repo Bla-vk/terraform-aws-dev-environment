@@ -72,7 +72,7 @@ I built this to rebuild, as code, the VPC and EC2 patterns I first created by ha
 
 ```
 .
-├── providers.tf               # Terraform and AWS provider configuration
+├── providers.tf               # Terraform, AWS provider and S3 backend configuration
 ├── main.tf                    # Calls the network and compute modules
 ├── variables.tf               # Input variables (host_os)
 ├── outputs.tf                 # Exposes the instance public IP
@@ -99,7 +99,9 @@ Each file has one job, which keeps the project easy to read and extend.
 
 ## How It Works
 
-**providers.tf** pins the AWS provider to `~> 6.0` (and the `http` provider to `~> 3.0`), sets the region to `eu-west-2` (London), and authenticates through a named local profile (`vscode`), so no credentials are ever written in code.
+**providers.tf** also configures the remote backend (see below). It pins the AWS provider to `~> 6.0` (and the `http` provider to `~> 3.0`), sets the region to `eu-west-2` (London), and authenticates through a named local profile (`vscode`), so no credentials are ever written in code.
+
+**Remote state.** Terraform state is stored in an S3 bucket (`precious-terraformstate-dev-2026`, key `dev-environment/terraform.tfstate`) instead of on my laptop. The bucket has versioning enabled, default encryption (SSE-S3) and all public access blocked, and `use_lockfile = true` makes Terraform write a lock object next to the state file, so two runs cannot change the same state at once. The bucket itself is created by hand with the AWS CLI, because Terraform cannot create the place that stores its own state.
 
 **Root `main.tf`** calls two modules. `module "network"` builds the network and returns the public subnet ID and the security group ID. `module "compute"` receives those two values as input variables and launches the server in that subnet with that security group. Terraform works out from these references that the network must exist before the server.
 
@@ -160,6 +162,23 @@ ssh-keygen -t ed25519 -f ~/.ssh/mainkey
 ```
 
 This creates `~/.ssh/mainkey` (private, never share or commit) and `~/.ssh/mainkey.pub` (public, uploaded to AWS by Terraform).
+
+- An S3 bucket for remote state, created once by hand (Terraform 1.10 or newer is needed for `use_lockfile`). Replace the bucket name with your own, because bucket names are globally unique:
+
+```bash
+BUCKET=your-unique-tfstate-bucket
+
+aws s3api create-bucket --bucket $BUCKET --region eu-west-2 \
+  --create-bucket-configuration LocationConstraint=eu-west-2 --profile vscode
+aws s3api put-bucket-versioning --bucket $BUCKET \
+  --versioning-configuration Status=Enabled --profile vscode
+aws s3api put-bucket-encryption --bucket $BUCKET --profile vscode \
+  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+aws s3api put-public-access-block --bucket $BUCKET --profile vscode \
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+Then put the same bucket name in the `backend "s3"` block in `providers.tf` and run `terraform init`.
 
 ---
 
@@ -312,20 +331,51 @@ After SSHing to the private server through the public server (jump host), `curl 
 
 ![nat destroy](screenshots/17-nat-destroy.png)
 
+### 16. Remote state backend configured
+
+After adding the `backend "s3"` block, `terraform init -migrate-state` completes successfully, and `.terraform/terraform.tfstate` records the backend type as `s3`. Terraform did not ask to copy any state because the environment had been destroyed, so the local state was empty.
+
+![terraform init for the s3 backend](screenshots/18-s3-backend-init.png)
+
+### 17. State and lock objects in the bucket
+
+After the first apply, the bucket holds `terraform.tfstate`, and `terraform.tfstate.tflock` appears while a run holds the lock.
+
+![state objects in the S3 console](screenshots/19-s3-state-objects.png)
+
+![state file listed with the AWS CLI](screenshots/20-s3-state-ls.png)
+
+### 18. State locking
+
+With one `terraform apply` waiting at its confirmation prompt, a second `terraform plan` fails with **Error acquiring the state lock** (an S3 `PreconditionFailed`, HTTP 412). The message names the lock ID, the operation and who holds it, so two runs cannot change the same state at once.
+
+![state lock error](screenshots/21-state-lock-error.png)
+
+### 19. State bucket: versioning, private, encrypted
+
+Versioning is enabled, so an earlier state file can be recovered. All public access is blocked, and objects are encrypted by default with SSE-S3.
+
+![bucket versioning](screenshots/22-s3-versioning.png)
+
+![block public access](screenshots/23-s3-block-public-access.png)
+
+![default encryption](screenshots/24-s3-encryption.png)
+
 ---
 
 ## Troubleshooting
 
 Problems I hit while building this, and what fixed them:
 
-| Problem                                           | Cause                                                                                                             | Fix                                                                                                                  |
-| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `docker: command not found` after SSH             | `user_data` runs in the background after boot, and can fail or not run at all                                     | Run `cloud-init status` and wait for `done`. Read `/var/log/cloud-init-output.log` for the failing command           |
-| `user_data` edits have no effect                  | `user_data` only runs on first boot, and the instance is not replaced when it changes                             | Set `user_data_replace_on_change = true`, or run `terraform apply -replace=aws_instance.dev_node`                    |
-| SSH or VS Code Remote-SSH times out               | The saved IP belonged to an instance that no longer existed (after a destroy or stop/start the public IP changes) | Run `terraform output dev_ip`, confirm the instance is running, and remove stale `Host` entries from `~/.ssh/config` |
-| SSH times out even though the instance is running | My public IP changed (new network, VPN or router restart), so the security group no longer matches                | Run `terraform apply` from the network I am connecting from. The rule updates in place                               |
-| `Reference to undeclared resource` during `plan`  | Example code used placeholder resource names (`aws_subnet.public`) that did not match the names in my `main.tf`   | Run `grep -n '^resource' main.tf` to list the real names and use those. `terraform validate` catches this in seconds |
-| `permission denied` running `docker`              | Group membership only applies to new login sessions                                                               | Log out and back in                                                                                                  |
+| Problem                                           | Cause                                                                                                             | Fix                                                                                                                                                        |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker: command not found` after SSH             | `user_data` runs in the background after boot, and can fail or not run at all                                     | Run `cloud-init status` and wait for `done`. Read `/var/log/cloud-init-output.log` for the failing command                                                 |
+| `user_data` edits have no effect                  | `user_data` only runs on first boot, and the instance is not replaced when it changes                             | Set `user_data_replace_on_change = true`, or run `terraform apply -replace=aws_instance.dev_node`                                                          |
+| SSH or VS Code Remote-SSH times out               | The saved IP belonged to an instance that no longer existed (after a destroy or stop/start the public IP changes) | Run `terraform output dev_ip`, confirm the instance is running, and remove stale `Host` entries from `~/.ssh/config`                                       |
+| SSH times out even though the instance is running | My public IP changed (new network, VPN or router restart), so the security group no longer matches                | Run `terraform apply` from the network I am connecting from. The rule updates in place                                                                     |
+| `Reference to undeclared resource` during `plan`  | Example code used placeholder resource names (`aws_subnet.public`) that did not match the names in my `main.tf`   | Run `grep -n '^resource' main.tf` to list the real names and use those. `terraform validate` catches this in seconds                                       |
+| `Error acquiring the state lock`                  | Another Terraform run holds the lock (or a run was interrupted and left the lock behind)                          | Wait for the other run to finish. Only if I am sure no run is active, release it with `terraform force-unlock <lock ID>` using the ID in the error message |
+| `permission denied` running `docker`              | Group membership only applies to new login sessions                                                               | Log out and back in                                                                                                                                        |
 
 ---
 
@@ -336,14 +386,14 @@ This is a learning environment, and a few choices are intentionally simple. Befo
 - **SSH and the web server are restricted to my current IP.** `dev-sg` allows port 22 and port 80 only from my own public IP (`/32`), and no other ports are open. Terraform looks the IP up on every run, so the rule follows me when it changes, but only when I run `terraform apply`. Running plans from a different network (a VPN, or a CI runner) would use that network's IP instead, so I run `plan` and `apply` locally. Port 22 is still reachable by anyone who shares my IP, for example on a shared ISP address, and key-based login is the second layer of protection.
 - **The private subnet is not reachable from the internet.** Servers there have no public IP, and the test server's security group allows SSH only from `dev-sg`, so I reach it through the public server as a jump host. NAT gateways cost money by the hour, so I only keep it running while testing.
 - **Credentials stay out of the code.** Authentication uses a local named profile, and the private key never leaves my machine.
-- **State and secrets stay out of Git.** `terraform.tfstate` can contain sensitive values, so the `.gitignore` excludes state files, `.terraform/`, `*.tfvars`, keys and `.env` files. `.terraform.lock.hcl` is committed so provider versions stay consistent. For team use, state would move to a remote backend such as S3 with locking.
+- **State and secrets stay out of Git.** `terraform.tfstate` can contain sensitive values, so the `.gitignore` excludes state files, `.terraform/`, `*.tfvars`, keys and `.env` files. `.terraform.lock.hcl` is committed so provider versions stay consistent. State is stored in a private S3 bucket with versioning, encryption and locking, and the local state files are deleted after the move. The bucket is created outside Terraform, so `terraform destroy` never removes it.
 - **Screenshots are redacted.** My home IP and AWS account ID are covered.
 
 ---
 
 ## Skills Demonstrated
 
-Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet Gateways, Security Groups, EC2, SSH key management, data sources, input variables and outputs, `user_data` bootstrapping, Docker Engine installation on Ubuntu, running a container from `user_data`, least-privilege security group rules, private subnets, NAT gateways and Elastic IPs, SSH jump hosts, Linux package management, `local-exec` provisioners, `templatefile` rendering, SSH config automation, troubleshooting with cloud-init logs, secrets hygiene with `.gitignore`
+Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet Gateways, Security Groups, EC2, SSH key management, data sources, input variables and outputs, `user_data` bootstrapping, Docker Engine installation on Ubuntu, running a container from `user_data`, least-privilege security group rules, private subnets, NAT gateways and Elastic IPs, SSH jump hosts, Linux package management, `local-exec` provisioners, `templatefile` rendering, SSH config automation, troubleshooting with cloud-init logs, secrets hygiene with `.gitignore`, Terraform remote state in S3, state locking, S3 bucket versioning, encryption and public access blocking
 
 ---
 
@@ -357,6 +407,8 @@ Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet G
 - State tracks real infrastructure, so it must be protected and kept out of version control.
 - Modules let one piece of infrastructure feed another through input variables and outputs, and `${path.module}` keeps file paths working from inside a module.
 - A private subnet needs a NAT gateway in a public subnet and a route to it before its servers can reach the internet. Comparing the server's outbound IP with the NAT's Elastic IP proves the route works.
+- Remote state in S3 removes the risk of losing a local state file, and locking stops two runs from corrupting it. The bucket has to be created first by hand, because Terraform cannot create the place its own state lives.
+- When there is no existing state to copy, `terraform init -migrate-state` completes silently, so I confirmed the backend by reading `.terraform/terraform.tfstate` and by listing the bucket after the first apply.
 - Opening only the port an app needs, and only to my own IP, keeps a public web server from being exposed to the whole internet.
 - Public IPs change when instances are replaced, so stale SSH config entries are a common cause of connection timeouts.
 
@@ -370,8 +422,8 @@ Done:
 - Containerised app (nginx in Docker) started from `user_data`, with only port 80 open and only to my IP
 - Refactored into reusable `network` and `compute` modules
 - Added a private subnet and NAT gateway, tested outbound access from a private server through a jump host
+- Moved state to a remote S3 backend with versioning, encryption and locking, and tested the lock
 
 Still to do:
 
-- Move state to a remote S3 backend with versioning and locking, then migrate the local state with `terraform init -migrate-state`
 - Add a GitHub Actions workflow to run `terraform fmt -check` and `terraform validate` on every push
