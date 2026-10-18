@@ -89,6 +89,9 @@ I built this to rebuild, as code, the VPC and EC2 patterns I first created by ha
 │       ├── outputs.tf         # instance public IP
 │       ├── userdata.tpl       # First-boot script: installs Docker, starts nginx
 │       └── linux-ssh-config.tpl   # SSH config template appended to ~/.ssh/config
+├── .github/
+│   └── workflows/
+│       └── terraform.yml      # CI: terraform fmt -check, init -backend=false, validate
 ├── .gitignore                 # Keeps state, keys and secrets out of Git
 └── screenshots/               # Evidence of each stage of the build
 ```
@@ -363,6 +366,28 @@ Versioning is enabled, so an earlier state file can be recovered. All public acc
 
 ![default encryption](screenshots/24-s3-encryption.png)
 
+### 20. CI with GitHub Actions
+
+A workflow (`.github/workflows/terraform.yml`) runs on every push and pull request. It checks out the code, installs Terraform, creates a dummy SSH public key (the code reads `~/.ssh/mainkey.pub`), then runs `terraform fmt -check -recursive`, `terraform init -backend=false` and `terraform validate`. The backend is skipped, so the runner needs no AWS credentials.
+
+![workflow runs](screenshots/25-actions-workflow-runs.png)
+
+![green run](screenshots/26-actions-green-run.png)
+
+![workflow file](screenshots/27-workflow-file.png)
+
+The build status badge at the top of this README comes from the workflow:
+
+![README badge](screenshots/28-readme-badge.png)
+
+To prove the check catches mistakes, I pushed a badly formatted `outputs.tf`. The **Check formatting** step failed (exit code 3) and the later steps were skipped.
+
+![red run](screenshots/29-actions-red-run-fmt.png)
+
+After running `terraform fmt -recursive` locally and pushing the fix, the same workflow passed.
+
+![green run after fix](screenshots/30-actions-green-after-fix.png)
+
 ---
 
 ## Troubleshooting
@@ -395,7 +420,7 @@ This is a learning environment, and a few choices are intentionally simple. Befo
 
 ## Skills Demonstrated
 
-Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet Gateways, Security Groups, EC2, SSH key management, data sources, input variables and outputs, `user_data` bootstrapping, Docker Engine installation on Ubuntu, running a container from `user_data`, least-privilege security group rules, private subnets, NAT gateways and Elastic IPs, SSH jump hosts, Linux package management, `local-exec` provisioners, `templatefile` rendering, SSH config automation, troubleshooting with cloud-init logs, secrets hygiene with `.gitignore`, Terraform remote state in S3, state locking, S3 bucket versioning, encryption and public access blocking
+Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet Gateways, Security Groups, EC2, SSH key management, data sources, input variables and outputs, `user_data` bootstrapping, Docker Engine installation on Ubuntu, running a container from `user_data`, least-privilege security group rules, private subnets, NAT gateways and Elastic IPs, SSH jump hosts, Linux package management, `local-exec` provisioners, `templatefile` rendering, SSH config automation, troubleshooting with cloud-init logs, secrets hygiene with `.gitignore`, Terraform remote state in S3, state locking, S3 bucket versioning, encryption and public access blocking, CI with GitHub Actions (`terraform fmt`, `validate`)
 
 ---
 
@@ -411,6 +436,7 @@ Terraform, Infrastructure as Code, Amazon VPC, subnets, route tables, Internet G
 - A private subnet needs a NAT gateway in a public subnet and a route to it before its servers can reach the internet. Comparing the server's outbound IP with the NAT's Elastic IP proves the route works.
 - Remote state in S3 removes the risk of losing a local state file, and locking stops two runs from corrupting it. The bucket has to be created first by hand, because Terraform cannot create the place its own state lives.
 - When there is no existing state to copy, `terraform init -migrate-state` completes silently, so I confirmed the backend by reading `.terraform/terraform.tfstate` and by listing the bucket after the first apply.
+- A CI workflow that runs `terraform fmt -check` and `validate` with `init -backend=false` catches formatting and syntax mistakes on every push without needing cloud credentials. Deliberately breaking the formatting and watching the run fail confirmed the check works.
 - Opening only the port an app needs, and only to my own IP, keeps a public web server from being exposed to the whole internet.
 - Public IPs change when instances are replaced, so stale SSH config entries are a common cause of connection timeouts.
 
@@ -425,7 +451,4 @@ Done:
 - Refactored into reusable `network` and `compute` modules
 - Added a private subnet and NAT gateway, tested outbound access from a private server through a jump host
 - Moved state to a remote S3 backend with versioning, encryption and locking, and tested the lock
-
-Still to do:
-
-- Add a GitHub Actions workflow to run `terraform fmt -check` and `terraform validate` on every push
+- Added a GitHub Actions workflow that runs `terraform fmt -check` and `terraform validate` on every push, and confirmed it fails on bad formatting
